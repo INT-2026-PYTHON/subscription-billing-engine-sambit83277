@@ -58,10 +58,229 @@ class BillingCycle:
     def run(self, as_of: date) -> BillingResult:
         """Bill all subscriptions whose current period ends on or before `as_of`."""
         # TODO Day 3
-        raise NotImplementedError("Day 3: implement BillingCycle.run")
+      import sqlite3
+        from calendar import monthrange
+
+        from billing_engine.billing.pipeline import build_invoice
+        from billing_engine.db import queries as q
+        from billing_engine.models import BillingPeriod, InvoiceStatus, LedgerDirection, SubscriptionStatus
+
+        def advance_period(start: date, billing_period: BillingPeriod) -> date:
+            if billing_period == BillingPeriod.MONTHLY:
+                month = 1 if start.month == 12 else start.month + 1
+                year = start.year + 1 if start.month == 12 else start.year
+                day = min(start.day, monthrange(year, month)[1])
+                return date(year, month, day)
+
+            if billing_period == BillingPeriod.YEARLY:
+                year = start.year + 1
+                day = min(start.day, monthrange(year, start.month)[1])
+                return date(year, start.month, day)
+
+            raise ValueError(f"Unsupported billing period: {billing_period}")
+
+        invoices_created = 0
+        invoices_skipped_duplicate = 0
+        trials_activated = 0
+
+        for sub in self.subscription_repo.list_all():
+            if (
+                sub.status == SubscriptionStatus.TRIAL
+                and sub.trial_end is not None
+                and sub.trial_end <= as_of
+            ):
+                self.subscription_repo.update_status(sub.id, SubscriptionStatus.ACTIVE)
+                trials_activated += 1
+
+        due = self.subscription_repo.get_due_for_billing(as_of)
+
+        for sub in due:
+            plan = self.plan_repo.get(sub.plan_id)
+            customer = self.customer_repo.get(sub.customer_id)
+            if plan is None or customer is None:
+                raise LookupError(f"Missing plan/customer for subscription {sub.id}")
+
+            strategy = self.strategy_factory(plan)
+            discount = self.discount_factory(sub.discount_id)
+            tax_calc, tax_context = self.tax_factory(customer)
+
+            usage_quantity = self.usage_repo.sum_for_period(
+                sub.id,
+                "units",
+                sub.current_period_start,
+                sub.current_period_end,
+            )
+            invoice_count = self.invoice_repo.count_for_subscription(sub.id)
+
+            draft = build_invoice(
+                subscription=sub,
+                plan=plan,
+                strategy=strategy,
+                discount=discount,
+                tax_calc=tax_calc,
+                tax_context=tax_context,
+                usage_quantity=usage_quantity,
+                period_start=sub.current_period_start,
+                period_end=sub.current_period_end,
+                invoice_count_so_far=invoice_count,
+            )
+
+            next_period_start = sub.current_period_end
+            next_period_end = advance_period(next_period_start, plan.billing_period)
+
+            try:
+                with self.db.transaction() as conn:
+                    invoice_id = q.insert_invoice(
+                        conn,
+                        draft.subscription_id,
+                        draft.period_start.isoformat(),
+                        draft.period_end.isoformat(),
+                        draft.total.currency,
+                        draft.subtotal.to_storage(),
+                        draft.discount_total.to_storage(),
+                        draft.tax_total.to_storage(),
+                        draft.total.to_storage(),
+                        InvoiceStatus.ISSUED.value,
+                        None,
+                        draft.pdf_path,
+                    )
+
+                    for item in draft.line_items:
+                        q.insert_invoice_line_item(
+                            conn,
+                            invoice_id,
+                            item.description,
+                            item.amount.to_storage(),
+                            item.kind.value,
+                        )
+
+                    q.insert_ledger_entry(
+                        conn,
+                        invoice_id,
+                        customer.id,
+                        draft.total.to_storage(),
+                        draft.total.currency,
+                        LedgerDirection.DEBIT.value,
+                        "Invoice issued",
+                    )
+
+                    q.update_subscription_period(
+                        conn,
+                        sub.id,
+                        next_period_start.isoformat(),
+                        next_period_end.isoformat(),
+                    )
+
+                invoices_created += 1
+            except sqlite3.IntegrityError:
+                invoices_skipped_duplicate += 1
+
+        return BillingResult(
+            invoices_created=invoices_created,
+            invoices_skipped_duplicate=invoices_skipped_duplicate,
+            trials_activated=trials_activated,
+        )
 
     # --------------------------------------------------------
-    def upgrade_subscription(self, subscription_id: int, new_plan_id: int, switch_date: date) -> None:
+ def upgrade_subscription(self, subscription_id: int, new_plan_id: int, switch_date: date) -> None:
         """Mid-cycle upgrade — Day 4 stretch."""
         # TODO Day 4
         raise NotImplementedError("Day 4: implement BillingCycle.upgrade_subscription")
+        import sqlite3
+
+        from billing_engine.billing.proration import compute_proration
+        from billing_engine.db import queries as q
+        from billing_engine.models import InvoiceStatus, LineItemKind, LedgerDirection
+
+        subscription = self.subscription_repo.get(subscription_id)
+        if subscription is None:
+            raise LookupError(f"Subscription {subscription_id} not found")
+
+        old_plan = self.plan_repo.get(subscription.plan_id)
+        new_plan = self.plan_repo.get(new_plan_id)
+        customer = self.customer_repo.get(subscription.customer_id)
+        if old_plan is None or new_plan is None or customer is None:
+            raise LookupError("Unable to load subscription, plan, or customer for upgrade")
+
+        old_strategy = self.strategy_factory(old_plan)
+        new_strategy = self.strategy_factory(new_plan)
+        old_plan_price = old_strategy.calculate(0)
+        new_plan_price = new_strategy.calculate(0)
+
+        tax_calc, tax_context = self.tax_factory(customer)
+        proration = compute_proration(
+            old_plan_price=old_plan_price,
+            new_plan_price=new_plan_price,
+            period_start=subscription.current_period_start,
+            period_end=subscription.current_period_end,
+            switch_date=switch_date,
+            tax_calc=tax_calc,
+            tax_context=tax_context,
+        )
+
+        credit_total = proration.credit_amount
+        charge_total = proration.charge_amount
+        tax_total = proration.charge_tax - proration.credit_tax
+        invoice_total = (charge_total - credit_total) + tax_total
+
+        try:
+            with self.db.transaction() as conn:
+                invoice_id = q.insert_invoice(
+                    conn,
+                    subscription.id,
+                    switch_date.isoformat(),
+                    subscription.current_period_end.isoformat(),
+                    invoice_total.currency,
+                    charge_total.to_storage(),
+                    credit_total.to_storage(),
+                    tax_total.to_storage(),
+                    invoice_total.to_storage(),
+                    InvoiceStatus.ISSUED.value,
+                    datetime.combine(switch_date, time.min).isoformat(timespec="seconds"),
+                    None,
+                )
+
+                q.insert_invoice_line_item(
+                    conn,
+                    invoice_id,
+                    "Proration credit",
+                    (-proration.credit_amount).to_storage(),
+                    LineItemKind.PRORATION_CREDIT.value,
+                )
+                q.insert_invoice_line_item(
+                    conn,
+                    invoice_id,
+                    "Proration charge",
+                    proration.charge_amount.to_storage(),
+                    LineItemKind.PRORATION_CHARGE.value,
+                )
+                if not proration.credit_tax.is_zero():
+                    q.insert_invoice_line_item(
+                        conn,
+                        invoice_id,
+                        "Proration credit tax",
+                        (-proration.credit_tax).to_storage(),
+                        LineItemKind.TAX.value,
+                    )
+                if not proration.charge_tax.is_zero():
+                    q.insert_invoice_line_item(
+                        conn,
+                        invoice_id,
+                        "Proration charge tax",
+                        proration.charge_tax.to_storage(),
+                        LineItemKind.TAX.value,
+                    )
+
+                q.insert_ledger_entry(
+                    conn,
+                    invoice_id,
+                    customer.id,
+                    invoice_total.to_storage(),
+                    invoice_total.currency,
+                    LedgerDirection.DEBIT.value,
+                    f"Proration for subscription {subscription_id}",
+                )
+
+                q.update_subscription_plan(conn, subscription_id, new_plan_id)
+        except sqlite3.IntegrityError:
+            raise

@@ -10,17 +10,14 @@ from billing_engine.discounts.base import Discount, DiscountContext
 
 
 class FixedAmountDiscount(Discount):
-    def __init__(self, amount: Money) -> None:
-        # TODO Day 1
-       if not isinstance(amount, Money):
+     def __init__(self, amount: Money) -> None:
+        if not isinstance(amount, Money):
             raise TypeError("FixedAmountDiscount amount must be Money")
         if amount.is_negative():
             raise ValueError("FixedAmountDiscount amount cannot be negative")
-        self.amount = amount  
+        self.amount = amount
 
- def apply(self, subtotal: Money, context: DiscountContext) -> Money:
-        # TODO Day 1
-        raise NotImplementedError("Day 1: implement FixedAmountDiscount.apply")
-       if self.amount.currency != subtotal.currency:
+    def apply(self, subtotal: Money, context: DiscountContext) -> Money:
+        if self.amount.currency != subtotal.currency:
             raise ValueError("discount currency must match subtotal currency")
-       return self.amount if self.amount < subtotal else subtotal
+        return self.amount if self.amount < subtotal else subtotal
